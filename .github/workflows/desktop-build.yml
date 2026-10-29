@@ -1,0 +1,190 @@
+name: Desktop Build
+# Builds from the private moonlitusun/cora source. It runs here because Actions
+# on a public repository is not billed against the private one's budget.
+run-name: Desktop Build ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "moonlitusun/cora ref to build. A desktop-v* tag publishes a release; anything else only builds."
+        required: true
+        type: string
+      server_url:
+        description: "CORA_SERVER_URL to bake in. Leave empty to use the CORA_SERVER_URL repo variable."
+        required: false
+        type: string
+      dev_http:
+        description: "Allow plain http to a private-network server. Required when server_url is http://, since a stock build accepts https only. Never enable for a release."
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-14
+            name: macos-aarch64
+          - platform: windows-latest
+            name: windows-x64
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ startsWith(inputs.ref, 'desktop-v') && inputs.ref || '' }}
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: moonlitusun/cora
+          ref: ${{ inputs.ref }}
+          # Read-only deploy key on moonlitusun/cora.
+          ssh-key: ${{ secrets.CORA_SOURCE_DEPLOY_KEY }}
+          # Release notes are read from the log since the previous desktop tag,
+          # which a shallow clone does not have.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      # aws-lc-sys (pulled in via reqwest/rustls) assembles with NASM on MSVC.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Bundle Pi wrapper
+        shell: bash
+        run: bash scripts/bundle-pi-wrapper.sh
+
+      - name: Vendor Node runtime (macOS)
+        if: runner.os == 'macOS'
+        run: bash scripts/vendor-node-runtime.sh arm64
+
+      - name: Vendor Node runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/vendor-node-runtime.ps1 -Arch x64
+
+      # The updater shows this in the prompt, and tauri-action writes it into
+      # both the release body and latest.json. Derived from the log so nobody has
+      # to remember to write it: a prompt that cannot say what changed is asking
+      # people to restart the app on trust alone.
+      - name: Collect release notes
+        id: notes
+        if: env.RELEASE_TAG != ''
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+          previous=$(git describe --tags --abbrev=0 --match 'desktop-v*' "${RELEASE_TAG}^" 2>/dev/null || true)
+          range=${previous:+$previous..}${RELEASE_TAG}
+          notes=$(git log --no-merges --pretty=format:'- %s' "$range" | grep -E '^- (feat|fix)\((desktop|server|agent)' || true)
+          [ -z "$notes" ] && notes="- Maintenance release"
+          {
+            echo "body<<NOTES_EOF"
+            echo "$notes"
+            echo "NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "$notes"
+
+      - name: Point the updater at the configured server
+        shell: bash
+        env:
+          CORA_SERVER_URL: ${{ inputs.server_url || vars.CORA_SERVER_URL }}
+        run: bash scripts/point-updater-at-server.sh
+
+      - name: Import Apple Certificate for macOS Signing
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASS: ${{ secrets.APPLE_CERTIFICATE_PASS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            echo "APPLE_CERTIFICATE is required for macOS releases" >&2
+            exit 1
+          fi
+          KEYCHAIN_PATH=$HOME/Library/Keychains/build.keychain-db
+          KEYCHAIN_PASS=cora_ci_pass
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH" || true
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+
+          curl -fL "https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer" -o /tmp/AppleWWDRCAG3.cer
+          security import /tmp/AppleWWDRCAG3.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign
+
+          P12_PATH=/tmp/certificate.p12
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$P12_PATH"
+          security import "$P12_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASS" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          rm -f "$P12_PATH" /tmp/AppleWWDRCAG3.cer
+
+      - name: Require macOS signing identity
+        if: runner.os == 'macOS'
+        working-directory: .
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: bash scripts/require_macos_signing_identity.sh
+
+      # Builds, signs updater artifacts, and for a desktop-v* ref publishes a
+      # release with latest.json into this repository.
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASS: ${{ secrets.APPLE_CERTIFICATE_PASS }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # Baked in by option_env! at compile time. Without it the installed app
+          # has no server to talk to and no UI to set one.
+          CORA_SERVER_URL: ${{ inputs.server_url || vars.CORA_SERVER_URL }}
+        with:
+          projectPath: desktop
+          # A plain-http server is refused by a stock build, so a build pointed at
+          # one has to carry the exception — including tagged releases, which are
+          # distributed inside the same network as the server. Derived from the
+          # URL rather than set by hand so the two cannot disagree.
+          args: ${{ (inputs.dev_http || startsWith(inputs.server_url || vars.CORA_SERVER_URL, 'http://')) && '--features dev-http' || '' }}
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: ${{ env.RELEASE_TAG != '' && 'Cora Desktop __VERSION__' || '' }}
+          # Lands in latest.json as `notes`, which is what the update prompt shows.
+          releaseBody: ${{ steps.notes.outputs.body }}
+          # The built commit lives in moonlitusun/cora, so the tag is cut from
+          # this repository's default branch instead.
+          releaseCommitish: main
+          # Published straight away rather than left as a draft. The two matrix
+          # jobs upload into the same release, so it is briefly visible carrying
+          # only one platform's assets; a client on the other platform finds no
+          # entry for itself in latest.json and simply offers no update until
+          # the second job lands.
+          releaseDraft: false
+          includeUpdaterJson: true
+
+      - name: Verify macOS app signature
+        if: runner.os == 'macOS'
+        working-directory: .
+        run: bash scripts/verify_macos_app_signature.sh desktop/src-tauri/target/release/bundle/macos/Cora.app

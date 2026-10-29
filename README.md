@@ -1,8 +1,9 @@
 # Cora Desktop
 
 Release artifacts for the Cora desktop app. Development happens elsewhere; this
-repository only hosts published builds, so the in-app updater can fetch them
-over unauthenticated HTTPS.
+repository builds and hosts the published installers. The build workflow checks
+out the private source with a read-only deploy key and runs here, where Actions
+is not billed against the private repository's budget.
 
 ## Download
 
